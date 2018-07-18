@@ -24,6 +24,7 @@
 #include "polly/ScopDetection.h"
 #include "polly/ScopInfo.h"
 #include "polly/Support/SCEVValidator.h"
+#include "polly/Support/ScopHelper.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
@@ -130,6 +131,63 @@ extern bool polly::PerfMonitoring;
 std::string getUniqueScopName(const Scop *S) {
   return "Scop Region: " + S->getNameStr() +
          " | Function: " + std::string(S->getFunction().getName());
+}
+
+static Function *createPollyAbstractIndexFunction(Module &M,
+                                                  PollyIRBuilder Builder,
+                                                  int NumDims) {
+
+  // HACK: pick up the name from ScopHelper.
+  const std::string BaseName = POLLY_ABSTRACT_INDEX_BASENAME;
+  // DEBUG(dbgs()  << __PRETTY_FUNCTION__ << " | HACK: hardcoded name of: " <<
+  // BaseName << "Fix this.\n");
+  const std::string Name = BaseName + "_" + std::to_string(NumDims);
+
+  Function *F = [&]() {
+    Function *Existing = nullptr;
+    if ((Existing = M.getFunction(Name))) {
+      //assert(false);
+      return Existing;
+    };
+
+    GlobalValue::LinkageTypes Linkage = Function::InternalLinkage;
+    IntegerType *I64Ty = Builder.getInt64Ty();
+    std::vector<Type *> ParamTys;
+    // offset(1) + stride(numdims) + ix(numdims) =  2 *numdims + 1)
+    for (int i = 1; i <= 1 + 2 * NumDims; i++) {
+      ParamTys.push_back(I64Ty);
+    }
+    auto FnType = FunctionType::get(I64Ty, ParamTys, /*IsVarArg = */ false);
+    return Function::Create(FnType, Linkage, Name, &M);
+  }();
+
+  BasicBlock *EntryBB = BasicBlock::Create(M.getContext(), "entry", F);
+  Builder.SetInsertPoint(EntryBB);
+
+  std::vector<Argument *> Args;
+  for (Argument &Arg : F->args()) {
+    Args.push_back(&Arg);
+  }
+
+  Args[0]->setName("offset");
+  // Offset
+  Value *TotalIx = Args[0];
+  for (int i = 0; i < NumDims; i++) {
+    const int StrideIx = 1 + i;
+    const int CurIxIx = NumDims + 1 + i;
+    Argument *StrideArg = Args[StrideIx];
+    Argument *CurIxArg = Args[CurIxIx];
+
+    StrideArg->setName("stride" + std::to_string(i));
+    CurIxArg->setName("ix" + std::to_string(i));
+
+    Value *StrideMulIx = Builder.CreateMul(StrideArg, CurIxArg,
+                                           "Stride_x_ix_" + std::to_string(i));
+    TotalIx = Builder.CreateAdd(TotalIx, StrideMulIx);
+  }
+  Builder.CreateRet(TotalIx);
+  F->addFnAttr(Attribute::AlwaysInline);
+  return F;
 }
 
 /// Used to store information PPCG wants for kills. This information is
@@ -1430,9 +1488,10 @@ static bool isValidFunctionInKernel(llvm::Function *F, bool AllowLibDevice) {
   if (AllowLibDevice && getCUDALibDeviceFuntion(Name).length() > 0)
     return true;
 
-  return F->isIntrinsic() &&
-         (Name.startswith("llvm.sqrt") || Name.startswith("llvm.fabs") ||
-          Name.startswith("llvm.copysign"));
+  return Name.startswith(POLLY_ABSTRACT_INDEX_BASENAME) ||
+         (F->isIntrinsic() &&
+          (Name.startswith("llvm.sqrt") || Name.startswith("llvm.fabs") ||
+           Name.startswith("llvm.copysign")));
 }
 
 /// Do not take `Function` as a subtree value.
@@ -1461,6 +1520,19 @@ getFunctionsFromRawSubtreeValues(SetVector<Value *> RawSubtreeValues,
   return SubtreeFunctions;
 }
 
+// return whether `Array` is used in `Kernel` or not.
+bool isArrayUsedInKernel(ScopArrayInfo *Array, ppcg_kernel *Kernel,
+                         gpu_prog *Prog) {
+  for (int i = 0; i < Prog->n_array; i++) {
+    isl_id *Id = isl_space_get_tuple_id(Prog->array[i].space, isl_dim_set);
+    const ScopArrayInfo *SAI = ScopArrayInfo::getFromId(isl::manage(Id));
+    if (SAI == Array)
+      return ppcg_kernel_requires_array_argument(Kernel, i);
+  }
+  // assert(false && "unable to find Array in known list of arrays");
+  return false; // Is this correct?
+}
+
 std::tuple<SetVector<Value *>, SetVector<Function *>, SetVector<const Loop *>,
            isl::space>
 GPUNodeBuilder::getReferencesInKernel(ppcg_kernel *Kernel) {
@@ -1480,6 +1552,9 @@ GPUNodeBuilder::getReferencesInKernel(ppcg_kernel *Kernel) {
   for (const auto &I : OutsideLoopIterations)
     SubtreeValues.insert(cast<SCEVUnknown>(I.second)->getValue());
 
+  for (const auto &I : SCEVToValue)
+    SubtreeValues.insert(I.second);
+
   isl_ast_node_foreach_descendant_top_down(
       Kernel->tree, collectReferencesInGPUStmt, &References);
 
@@ -1492,8 +1567,10 @@ GPUNodeBuilder::getReferencesInKernel(ppcg_kernel *Kernel) {
     return S.contains(L) || L->contains(S.getEntry());
   });
 
-  for (auto &SAI : S.arrays())
-    SubtreeValues.remove(SAI->getBasePtr());
+  for (auto &SAI : S.arrays()) {
+    if (isArrayUsedInKernel(SAI, Kernel, Prog))
+      SubtreeValues.remove(SAI->getBasePtr());
+  }
 
   isl_space *Space = S.getParamSpace().release();
   for (long i = 0, n = isl_space_dim(Space, isl_dim_param); i < n; i++) {
@@ -1772,10 +1849,27 @@ void GPUNodeBuilder::setupKernelSubtreeFunctions(
       Clone =
           Function::Create(Fn->getFunctionType(), GlobalValue::ExternalLinkage,
                            ClonedFnName, GPUModule.get());
+
+    // For our polly_array_index function, we need readnone attribute so that
+    // dead code elimination nukes it. In general, it is good practice
+    // to copy over attributes.
+    Clone->setAttributes(Fn->getAttributes());
+
     assert(Clone && "Expected cloned function to be initialized.");
     assert(ValueMap.find(Fn) == ValueMap.end() &&
            "Fn already present in ValueMap");
     ValueMap[Fn] = Clone;
+  }
+
+  Module *Host = S.getFunction().getParent();
+  for (int i = 0; i <= 4; i++) {
+    const std::string BaseName = POLLY_ABSTRACT_INDEX_BASENAME;
+    Function *HostFn = Host->getFunction(BaseName + "_" + std::to_string(i));
+    Function *GPUFn = createPollyAbstractIndexFunction(*GPUModule, Builder, i);
+    if (HostFn) {
+      assert(ValueMap.find(HostFn) == ValueMap.end());
+      ValueMap[HostFn] = GPUFn;
+    }
   }
 }
 void GPUNodeBuilder::createKernel(__isl_take isl_ast_node *KernelStmt) {
@@ -2012,18 +2106,42 @@ GPUNodeBuilder::createKernelFunctionDecl(ppcg_kernel *Kernel,
     const ScopArrayInfo *SAI = ScopArrayInfo::getFromId(isl::manage_copy(Id));
     Type *EleTy = SAI->getElementType();
     Value *Val = &*Arg;
-    SmallVector<const SCEV *, 4> Sizes;
     isl_ast_build *Build =
         isl_ast_build_from_context(isl_set_copy(Prog->context));
-    Sizes.push_back(nullptr);
-    for (long j = 1, n = Kernel->array[i].array->n_index; j < n; j++) {
-      isl_ast_expr *DimSize = isl_ast_build_expr_from_pw_aff(
-          Build, isl_multi_pw_aff_get_pw_aff(Kernel->array[i].array->bound, j));
-      auto V = ExprBuilder.create(DimSize);
-      Sizes.push_back(SE.getSCEV(V));
-    }
+
+    SmallVector<const SCEV *, 4> Sizes;
+
+    // TODO: take "correct" capture (const & or whatever of SAI)
+    // TODO: this is so fugly, find a better way to express this :(
+    ShapeInfo NewShape = [&](SmallVector<const SCEV *, 4> &Sizes) {
+      if (SAI->hasStrides()) {
+        // TODO: find some way to merge the code? Here, we know the outermose
+        // dimension index so we can start from 0. In the sizes code, we need
+        // to start from 1 to indicate that we do not know the shape of the
+        // outermost dim.
+        for (long j = 0, n = Kernel->array[i].array->n_index; j < n; j++) {
+          isl_ast_expr *DimSize = isl_ast_build_expr_from_pw_aff(
+              Build,
+              isl_multi_pw_aff_get_pw_aff(Kernel->array[i].array->bound, j));
+          auto V = ExprBuilder.create(DimSize);
+          Sizes.push_back(SE.getSCEV(V));
+        }
+        return SAI->getShape();
+      } else {
+        Sizes.push_back(nullptr);
+        for (long j = 1, n = Kernel->array[i].array->n_index; j < n; j++) {
+          isl_ast_expr *DimSize = isl_ast_build_expr_from_pw_aff(
+              Build,
+              isl_multi_pw_aff_get_pw_aff(Kernel->array[i].array->bound, j));
+          auto V = ExprBuilder.create(DimSize);
+          Sizes.push_back(SE.getSCEV(V));
+        }
+        return ShapeInfo::fromSizes(Sizes);
+      }
+    }(Sizes);
+
     const ScopArrayInfo *SAIRep =
-        S.getOrCreateScopArrayInfo(Val, EleTy, Sizes, MemoryKind::Array);
+        S.getOrCreateScopArrayInfo(Val, EleTy, NewShape, MemoryKind::Array);
     LocalArrays.push_back(Val);
 
     isl_ast_build_free(Build);
@@ -2242,6 +2360,7 @@ void GPUNodeBuilder::createKernelVariables(ppcg_kernel *Kernel, Function *FN) {
       isl_val_free(Val);
       ArrayTy = ArrayType::get(ArrayTy, Bound);
     }
+    const ShapeInfo NewShape = ShapeInfo::fromSizes(Sizes);
 
     const ScopArrayInfo *SAI;
     Value *Allocation;
@@ -2258,8 +2377,8 @@ void GPUNodeBuilder::createKernelVariables(ppcg_kernel *Kernel, Function *FN) {
     } else {
       llvm_unreachable("unknown variable type");
     }
-    SAI =
-        S.getOrCreateScopArrayInfo(Allocation, EleTy, Sizes, MemoryKind::Array);
+    SAI = S.getOrCreateScopArrayInfo(Allocation, EleTy, NewShape,
+                                     MemoryKind::Array);
     Id = isl_id_alloc(S.getIslCtx().get(), Var.name, nullptr);
     IDToValue[Id] = Allocation;
     LocalArrays.push_back(Allocation);
@@ -3532,7 +3651,7 @@ public:
 
       NodeBuilder.addParameters(S->getContext().release());
       Value *RTC = NodeBuilder.createRTC(Condition);
-      Builder.GetInsertBlock()->getTerminator()->setOperand(0, RTC);
+      Builder.GetInsertBlock()->getTerminator()->setOperand(0, Builder.getTrue());
 
       Builder.SetInsertPoint(&*StartBlock->begin());
 

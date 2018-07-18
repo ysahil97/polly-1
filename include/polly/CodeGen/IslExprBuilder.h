@@ -93,7 +93,9 @@ class IslExprBuilder {
 public:
   /// A map from isl_ids to llvm::Values.
   typedef llvm::MapVector<isl_id *, llvm::AssertingVH<llvm::Value>> IDToValueTy;
-
+  /// A map from const SCEV* to llvm::Values
+  typedef llvm::MapVector<const llvm::SCEV *, llvm::AssertingVH<llvm::Value>>
+      SCEVToValueTy;
   typedef llvm::MapVector<isl_id *, const ScopArrayInfo *> IDToScopArrayInfoTy;
 
   /// A map from isl_ids to ScopArrayInfo objects.
@@ -131,9 +133,10 @@ public:
   /// @param LI          LoopInfo analysis for the current function.
   /// @param StartBlock The first basic block after the RTC.
   IslExprBuilder(Scop &S, PollyIRBuilder &Builder, IDToValueTy &IDToValue,
-                 ValueMapT &GlobalMap, const llvm::DataLayout &DL,
-                 llvm::ScalarEvolution &SE, llvm::DominatorTree &DT,
-                 llvm::LoopInfo &LI, llvm::BasicBlock *StartBlock);
+                 SCEVToValueTy &SCEVToValue, ValueMapT &GlobalMap,
+                 const llvm::DataLayout &DL, llvm::ScalarEvolution &SE,
+                 llvm::DominatorTree &DT, llvm::LoopInfo &LI,
+                 llvm::BasicBlock *StartBlock);
 
   /// Create LLVM-IR for an isl_ast_expr[ession].
   ///
@@ -210,6 +213,7 @@ private:
 
   PollyIRBuilder &Builder;
   IDToValueTy &IDToValue;
+  SCEVToValueTy &SCEVToValue;
   ValueMapT &GlobalMap;
 
   const llvm::DataLayout &DL;
@@ -272,6 +276,10 @@ private:
   /// @return A value that represents the result of the multiplication.
   llvm::Value *createMul(llvm::Value *LHS, llvm::Value *RHS,
                          const llvm::Twine &Name = "");
+
+  // Provide a uniform interface to lookup replacements of the old value
+  // in the various maps we provide.
+  llvm::Value *getLatestValue(llvm::Value *Old);
 };
 } // namespace polly
 

@@ -429,7 +429,7 @@ bool ScopBuilder::buildAccessMultiDimFixed(MemAccInst Inst, ScopStmt *Stmt) {
         ConstantInt::get(IntegerType::getInt64Ty(BasePtr->getContext()), V)));
 
   addArrayAccess(Stmt, Inst, AccType, BasePointer->getValue(), ElementType,
-                 true, Subscripts, SizesSCEV, Val);
+                 true, Subscripts, ShapeInfo::fromSizes(SizesSCEV), Val);
   return true;
 }
 
@@ -480,7 +480,8 @@ bool ScopBuilder::buildAccessMultiDimParam(MemAccInst Inst, ScopStmt *Stmt) {
     scop->invalidate(DELINEARIZATION, Inst->getDebugLoc(), Inst->getParent());
 
   addArrayAccess(Stmt, Inst, AccType, BasePointer->getValue(), ElementType,
-                 true, AccItr->second.DelinearizedSubscripts, Sizes, Val);
+                 true, AccItr->second.DelinearizedSubscripts,
+                 ShapeInfo::fromSizes(Sizes), Val);
   return true;
 }
 
@@ -522,11 +523,14 @@ bool ScopBuilder::buildAccessMemIntrinsic(MemAccInst Inst, ScopStmt *Stmt) {
 
   auto *DestPtrSCEV = dyn_cast<SCEVUnknown>(SE.getPointerBase(DestAccFunc));
   assert(DestPtrSCEV);
+  // TODO: code smell, why doe we initialize an empty shape? I don't recall the
+  // details
+  //       anymore.
   DestAccFunc = SE.getMinusSCEV(DestAccFunc, DestPtrSCEV);
   addArrayAccess(Stmt, Inst, MemoryAccess::MUST_WRITE, DestPtrSCEV->getValue(),
                  IntegerType::getInt8Ty(DestPtrVal->getContext()),
-                 LengthIsAffine, {DestAccFunc, LengthVal}, {nullptr},
-                 Inst.getValueOperand());
+                 LengthIsAffine, {DestAccFunc, LengthVal},
+                 ShapeInfo::fromSizes({nullptr}), Inst.getValueOperand());
 
   auto *MemTrans = dyn_cast<MemTransferInst>(MemIntr);
   if (!MemTrans)
@@ -547,13 +551,16 @@ bool ScopBuilder::buildAccessMemIntrinsic(MemAccInst Inst, ScopStmt *Stmt) {
   SrcAccFunc = SE.getMinusSCEV(SrcAccFunc, SrcPtrSCEV);
   addArrayAccess(Stmt, Inst, MemoryAccess::READ, SrcPtrSCEV->getValue(),
                  IntegerType::getInt8Ty(SrcPtrVal->getContext()),
-                 LengthIsAffine, {SrcAccFunc, LengthVal}, {nullptr},
-                 Inst.getValueOperand());
+                 LengthIsAffine, {SrcAccFunc, LengthVal},
+                 ShapeInfo::fromSizes({nullptr}), Inst.getValueOperand());
 
   return true;
 }
 
 bool ScopBuilder::buildAccessCallInst(MemAccInst Inst, ScopStmt *Stmt) {
+  if (buildAccessPollyAbstractIndex(Inst, Stmt))
+    return true;
+
   auto *CI = dyn_cast_or_null<CallInst>(Inst);
 
   if (CI == nullptr)
@@ -565,6 +572,7 @@ bool ScopBuilder::buildAccessCallInst(MemAccInst Inst, ScopStmt *Stmt) {
   bool ReadOnly = false;
   auto *AF = SE.getConstant(IntegerType::getInt64Ty(CI->getContext()), 0);
   auto *CalledFunction = CI->getCalledFunction();
+
   switch (AA.getModRefBehavior(CalledFunction)) {
   case FMRB_UnknownModRefBehavior:
     llvm_unreachable("Unknown mod ref behaviour cannot be represented.");
@@ -591,9 +599,11 @@ bool ScopBuilder::buildAccessCallInst(MemAccInst Inst, ScopStmt *Stmt) {
       if (ArgSCEV->isZero())
         continue;
 
+      // TODO: again, why do we create a shape with a nullptr shape?
       auto *ArgBasePtr = cast<SCEVUnknown>(SE.getPointerBase(ArgSCEV));
       addArrayAccess(Stmt, Inst, AccType, ArgBasePtr->getValue(),
-                     ArgBasePtr->getType(), false, {AF}, {nullptr}, CI);
+                     ArgBasePtr->getType(), false, {AF},
+                     ShapeInfo::fromSizes({nullptr}), CI);
     }
     return true;
   }
@@ -643,7 +653,8 @@ void ScopBuilder::buildAccessSingleDim(MemAccInst Inst, ScopStmt *Stmt) {
     AccType = MemoryAccess::MAY_WRITE;
 
   addArrayAccess(Stmt, Inst, AccType, BasePointer->getValue(), ElementType,
-                 IsAffine, {AccessFunction}, {nullptr}, Val);
+                 IsAffine, {AccessFunction}, ShapeInfo::fromSizes({nullptr}),
+                 Val);
 }
 
 void ScopBuilder::buildMemoryAccess(MemAccInst Inst, ScopStmt *Stmt) {
@@ -660,6 +671,93 @@ void ScopBuilder::buildMemoryAccess(MemAccInst Inst, ScopStmt *Stmt) {
     return;
 
   buildAccessSingleDim(Inst, Stmt);
+}
+
+bool ScopBuilder::buildAccessPollyAbstractIndex(MemAccInst Inst,
+                                                ScopStmt *Stmt) {
+  auto optionalCallGEP = getAbstractIndexingCall(Inst, SE);
+  if (!optionalCallGEP)
+    return false;
+
+  CallInst *Call;
+  GEPOperator *GEP;
+  std::tie(Call, GEP) = *optionalCallGEP;
+
+  if ((Call->getNumArgOperands()) % 2 != 1) {
+    return false;
+  }
+
+  const int NArrayDims = (Call->getNumArgOperands()) / 2;
+
+  Value *BasePtr = GEP->getPointerOperand();
+
+  std::vector<const SCEV *> Subscripts;
+  std::vector<const SCEV *> Strides;
+  Loop *SurroundingLoop = Stmt->getSurroundingLoop();
+
+  InvariantLoadsSetTy AccessILS;
+
+  const SCEV *OffsetSCEV = [&] {
+    Value *Offset = Call->getArgOperand(0);
+    assert(Offset);
+    const SCEV *OffsetSCEV = SE.getSCEV(Offset);
+
+    if (!isAffineExpr(&scop->getRegion(), SurroundingLoop, OffsetSCEV, SE,
+                      &AccessILS)) {
+      return (const SCEV *)nullptr;
+    }
+
+    // Offsets are always loaded from the array, they will get invariant
+    // load hoisted correctly later.
+    for (LoadInst *L : AccessILS) {
+      scop->addRequiredInvariantLoad(L);
+    }
+    AccessILS.clear();
+
+    return OffsetSCEV;
+  }();
+
+  if (!OffsetSCEV)
+    return false;
+
+  for (int i = 0; i < NArrayDims; i++) {
+    Value *Ix = Call->getArgOperand(1 + NArrayDims + i);
+    const SCEV *IxSCEV = SE.getSCEV(Ix);
+    ensureValueRead(Ix, Stmt);
+    Subscripts.push_back(IxSCEV);
+
+    Value *Stride = Call->getArgOperand(1 + i);
+    const SCEV *StrideSCEV = SE.getSCEV(Stride);
+
+    if (!isAffineExpr(&scop->getRegion(), SurroundingLoop, StrideSCEV, SE,
+                      &AccessILS)) {
+      return false;
+    }
+
+    for (LoadInst *L : AccessILS) {
+      scop->addRequiredInvariantLoad(L);
+    }
+    AccessILS.clear();
+
+    Strides.push_back(StrideSCEV);
+  }
+
+  Value *Val = Inst.getValueOperand();
+  Type *ElementType = Val->getType();
+  assert(BasePtr);
+  assert(ElementType);
+
+  enum MemoryAccess::AccessType AccType =
+      isa<LoadInst>(Inst) ? MemoryAccess::READ : MemoryAccess::MUST_WRITE;
+  // scop->invalidate(DELINEARIZATION, Inst->getDebugLoc(), Inst->getParent());
+
+  // NOTE: this should be fromStrides.
+  // NOTE: To be able to change this, we need to teach ScopArrayInfo to recieve
+  // a Shape object. So, do that first.
+  addArrayAccess(Stmt, Inst, AccType, BasePtr, ElementType, /*IsAffine=*/true,
+                 Subscripts, ShapeInfo::fromStrides(Strides, OffsetSCEV), Val);
+
+  return true;
 }
 
 void ScopBuilder::buildAccessFunctions() {
@@ -1011,8 +1109,7 @@ void ScopBuilder::buildAccessFunctions(ScopStmt *Stmt, BasicBlock &BB,
 MemoryAccess *ScopBuilder::addMemoryAccess(
     ScopStmt *Stmt, Instruction *Inst, MemoryAccess::AccessType AccType,
     Value *BaseAddress, Type *ElementType, bool Affine, Value *AccessValue,
-    ArrayRef<const SCEV *> Subscripts, ArrayRef<const SCEV *> Sizes,
-    MemoryKind Kind) {
+    ArrayRef<const SCEV *> Subscripts, ShapeInfo Shape, MemoryKind Kind) {
   bool isKnownMustAccess = false;
 
   // Accesses in single-basic block statements are always executed.
@@ -1039,7 +1136,7 @@ MemoryAccess *ScopBuilder::addMemoryAccess(
     AccType = MemoryAccess::MAY_WRITE;
 
   auto *Access = new MemoryAccess(Stmt, Inst, AccType, BaseAddress, ElementType,
-                                  Affine, Subscripts, Sizes, AccessValue, Kind);
+                                  Affine, Subscripts, Shape, AccessValue, Kind);
 
   scop->addAccessFunction(Access);
   Stmt->addAccess(Access);
@@ -1051,12 +1148,11 @@ void ScopBuilder::addArrayAccess(ScopStmt *Stmt, MemAccInst MemAccInst,
                                  Value *BaseAddress, Type *ElementType,
                                  bool IsAffine,
                                  ArrayRef<const SCEV *> Subscripts,
-                                 ArrayRef<const SCEV *> Sizes,
-                                 Value *AccessValue) {
+                                 ShapeInfo Shape, Value *AccessValue) {
   ArrayBasePointers.insert(BaseAddress);
   auto *MemAccess = addMemoryAccess(Stmt, MemAccInst, AccType, BaseAddress,
                                     ElementType, IsAffine, AccessValue,
-                                    Subscripts, Sizes, MemoryKind::Array);
+                                    Subscripts, Shape, MemoryKind::Array);
 
   if (!DetectFortranArrays)
     return;
@@ -1090,7 +1186,8 @@ void ScopBuilder::ensureValueWrite(Instruction *Inst) {
 
   addMemoryAccess(Stmt, Inst, MemoryAccess::MUST_WRITE, Inst, Inst->getType(),
                   true, Inst, ArrayRef<const SCEV *>(),
-                  ArrayRef<const SCEV *>(), MemoryKind::Value);
+                  ShapeInfo::fromSizes(ArrayRef<const SCEV *>()),
+                  MemoryKind::Value);
 }
 
 void ScopBuilder::ensureValueRead(Value *V, ScopStmt *UserStmt) {
@@ -1128,7 +1225,8 @@ void ScopBuilder::ensureValueRead(Value *V, ScopStmt *UserStmt) {
       break;
 
     addMemoryAccess(UserStmt, nullptr, MemoryAccess::READ, V, V->getType(),
-                    true, V, ArrayRef<const SCEV *>(), ArrayRef<const SCEV *>(),
+                    true, V, ArrayRef<const SCEV *>(),
+                    ShapeInfo::fromSizes(ArrayRef<const SCEV *>()),
                     MemoryKind::Value);
 
     // Inter-statement uses need to write the value in their defining statement.
@@ -1145,8 +1243,8 @@ void ScopBuilder::ensurePHIWrite(PHINode *PHI, ScopStmt *IncomingStmt,
   // will create an exit PHI SAI object. It is needed during code generation
   // and would be created later anyway.
   if (IsExitBlock)
-    scop->getOrCreateScopArrayInfo(PHI, PHI->getType(), {},
-                                   MemoryKind::ExitPHI);
+    scop->getOrCreateScopArrayInfo(
+        PHI, PHI->getType(), ShapeInfo::fromSizes({}), MemoryKind::ExitPHI);
 
   // This is possible if PHI is in the SCoP's entry block. The incoming blocks
   // from outside the SCoP's region have no statement representation.
@@ -1167,17 +1265,19 @@ void ScopBuilder::ensurePHIWrite(PHINode *PHI, ScopStmt *IncomingStmt,
     return;
   }
 
-  MemoryAccess *Acc = addMemoryAccess(
-      IncomingStmt, PHI, MemoryAccess::MUST_WRITE, PHI, PHI->getType(), true,
-      PHI, ArrayRef<const SCEV *>(), ArrayRef<const SCEV *>(),
-      IsExitBlock ? MemoryKind::ExitPHI : MemoryKind::PHI);
+  MemoryAccess *Acc =
+      addMemoryAccess(IncomingStmt, PHI, MemoryAccess::MUST_WRITE, PHI,
+                      PHI->getType(), true, PHI, ArrayRef<const SCEV *>(),
+                      ShapeInfo::fromSizes(ArrayRef<const SCEV *>()),
+                      IsExitBlock ? MemoryKind::ExitPHI : MemoryKind::PHI);
   assert(Acc);
   Acc->addIncoming(IncomingBlock, IncomingValue);
 }
 
 void ScopBuilder::addPHIReadAccess(ScopStmt *PHIStmt, PHINode *PHI) {
   addMemoryAccess(PHIStmt, PHI, MemoryAccess::READ, PHI, PHI->getType(), true,
-                  PHI, ArrayRef<const SCEV *>(), ArrayRef<const SCEV *>(),
+                  PHI, ArrayRef<const SCEV *>(),
+                  ShapeInfo::fromSizes(ArrayRef<const SCEV *>()),
                   MemoryKind::PHI);
 }
 
@@ -1360,7 +1460,7 @@ void ScopBuilder::buildAccessRelations(ScopStmt &Stmt) {
       Ty = MemoryKind::Array;
 
     auto *SAI = scop->getOrCreateScopArrayInfo(Access->getOriginalBaseAddr(),
-                                               ElementType, Access->Sizes, Ty);
+                                               ElementType, Access->Shape, Ty);
     Access->buildAccessRelation(SAI);
     scop->addAccessData(Access);
   }
@@ -1502,7 +1602,8 @@ void ScopBuilder::buildScop(Region &R, AssumptionCache &AC,
     Instruction *GlobalRead = GlobalReadPair.second;
     for (auto *BP : ArrayBasePointers)
       addArrayAccess(GlobalReadStmt, MemAccInst(GlobalRead), MemoryAccess::READ,
-                     BP, BP->getType(), false, {AF}, {nullptr}, GlobalRead);
+                     BP, BP->getType(), false, {AF},
+                     ShapeInfo::fromSizes({nullptr}), GlobalRead);
   }
 
   scop->buildInvariantEquivalenceClasses();

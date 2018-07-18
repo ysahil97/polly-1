@@ -248,6 +248,10 @@ static cl::opt<bool> PollyPrintInstructions(
 
 //===----------------------------------------------------------------------===//
 
+raw_ostream &polly::operator<<(raw_ostream &OS, const ShapeInfo &Shape) {
+  return Shape.print(OS);
+}
+
 // Create a sequence of two schedules. Either argument may be null and is
 // interpreted as the empty schedule. Can also return null if both schedules are
 // empty.
@@ -318,10 +322,11 @@ static const ScopArrayInfo *identifyBasePtrOriginSAI(Scop *S, Value *BasePtr) {
 }
 
 ScopArrayInfo::ScopArrayInfo(Value *BasePtr, Type *ElementType, isl::ctx Ctx,
-                             ArrayRef<const SCEV *> Sizes, MemoryKind Kind,
+                             ShapeInfo Shape, MemoryKind Kind,
                              const DataLayout &DL, Scop *S,
                              const char *BaseName)
-    : BasePtr(BasePtr), ElementType(ElementType), Kind(Kind), DL(DL), S(*S) {
+    : BasePtr(BasePtr), ElementType(ElementType), Kind(Kind), DL(DL),
+      Shape(ShapeInfo::none()), S(*S) {
   std::string BasePtrName =
       BaseName ? BaseName
                : getIslCompatibleName("MemRef", BasePtr, S->getNextArrayIdx(),
@@ -329,7 +334,12 @@ ScopArrayInfo::ScopArrayInfo(Value *BasePtr, Type *ElementType, isl::ctx Ctx,
                                       UseInstructionNames);
   Id = isl::id::alloc(Ctx, BasePtrName, this);
 
-  updateSizes(Sizes);
+  // TODO: why do we need updateSizes() ? Why don't we set this up in the
+  // ctor?
+  if (Shape.hasSizes())
+    updateSizes(Shape.sizes());
+  else
+    updateStrides(Shape.strides(), Shape.offset());
 
   if (!BasePtr || Kind != MemoryKind::Array) {
     BasePtrOriginSAI = nullptr;
@@ -415,27 +425,61 @@ void ScopArrayInfo::applyAndSetFAD(Value *FAD) {
   DimensionSizesPw[0] = PwAff;
 }
 
+void ScopArrayInfo::overwriteSizeWithStrides(ArrayRef<const SCEV *> Strides,
+                                             const SCEV *Offset) {
+
+  // HACK: first set our shape to a stride based shape so that we don't
+  // assert within updateStrides. Move this into a bool parameter of
+  // updateStrides
+  Shape = ShapeInfo::fromStrides(Strides, Offset);
+  updateStrides(Strides, Offset);
+}
+bool ScopArrayInfo::updateStrides(ArrayRef<const SCEV *> Strides,
+                                  const SCEV *Offset) {
+  Shape.setStrides(Strides, Offset);
+  DimensionSizesPw.clear();
+  for (size_t i = 0; i < Shape.getNumberOfDimensions(); i++) {
+    isl::space Space(S.getIslCtx(), 1, 0);
+
+    std::string param_name = getIslCompatibleName(
+        "stride_" + std::to_string(i) + "__", getName(), "");
+    isl::id IdPwAff = isl::id::alloc(S.getIslCtx(), param_name, this);
+
+    Space = Space.set_dim_id(isl::dim::param, 0, IdPwAff);
+    isl::pw_aff PwAff =
+        isl::aff::var_on_domain(isl::local_space(Space), isl::dim::param, 0);
+
+    DimensionSizesPw.push_back(PwAff);
+  }
+  return true;
+}
+
 bool ScopArrayInfo::updateSizes(ArrayRef<const SCEV *> NewSizes,
                                 bool CheckConsistency) {
-  int SharedDims = std::min(NewSizes.size(), DimensionSizes.size());
-  int ExtraDimsNew = NewSizes.size() - SharedDims;
-  int ExtraDimsOld = DimensionSizes.size() - SharedDims;
+  if (Shape.isInitialized()) {
+    const SmallVector<const SCEV *, 4> &DimensionSizes = Shape.sizes();
+    int SharedDims = std::min(NewSizes.size(), DimensionSizes.size());
+    int ExtraDimsNew = NewSizes.size() - SharedDims;
+    int ExtraDimsOld = DimensionSizes.size() - SharedDims;
 
-  if (CheckConsistency) {
-    for (int i = 0; i < SharedDims; i++) {
-      auto *NewSize = NewSizes[i + ExtraDimsNew];
-      auto *KnownSize = DimensionSizes[i + ExtraDimsOld];
-      if (NewSize && KnownSize && NewSize != KnownSize)
-        return false;
+    if (CheckConsistency) {
+      for (int i = 0; i < SharedDims; i++) {
+        auto *NewSize = NewSizes[i + ExtraDimsNew];
+        auto *KnownSize = DimensionSizes[i + ExtraDimsOld];
+        if (NewSize && KnownSize && NewSize != KnownSize)
+          return false;
+      }
+
+      if (DimensionSizes.size() >= NewSizes.size())
+        return true;
     }
-
-    if (DimensionSizes.size() >= NewSizes.size())
-      return true;
   }
-
+  SmallVector<const SCEV *, 4> DimensionSizes;
   DimensionSizes.clear();
   DimensionSizes.insert(DimensionSizes.begin(), NewSizes.begin(),
                         NewSizes.end());
+  Shape.setSizes(DimensionSizes);
+
   DimensionSizesPw.clear();
   for (const SCEV *Expr : DimensionSizes) {
     if (!Expr) {
@@ -468,7 +512,7 @@ void ScopArrayInfo::print(raw_ostream &OS, bool SizeAsPwAff) const {
   bool IsOutermostSizeKnown = SizeAsPwAff && FAD;
 
   if (!IsOutermostSizeKnown && getNumberOfDimensions() > 0 &&
-      !getDimensionSize(0)) {
+      !getDimensionSizePw(0)) {
     OS << "[*]";
     u++;
   }
@@ -799,7 +843,7 @@ void MemoryAccess::assumeNoOutOfBound() {
 
 void MemoryAccess::buildMemIntrinsicAccessRelation() {
   assert(isMemoryIntrinsic());
-  assert(Subscripts.size() == 2 && Sizes.size() == 1);
+  assert(Subscripts.size() == 2 && Shape.sizes().size() == 1);
 
   isl::pw_aff SubscriptPWA = getPwAff(Subscripts[0]);
   isl::map SubscriptMap = isl::map::from_pw_aff(SubscriptPWA);
@@ -867,7 +911,8 @@ void MemoryAccess::computeBoundsOnAccessRelation(unsigned ElementSize) {
 }
 
 void MemoryAccess::foldAccessRelation() {
-  if (Sizes.size() < 2 || isa<SCEVConstant>(Sizes[1]))
+  if (Shape.getNumberOfDimensions() < 2 ||
+      isa<SCEVConstant>(Shape.getSizesOrStrides()[1]))
     return;
 
   int Size = Subscripts.size();
@@ -877,7 +922,7 @@ void MemoryAccess::foldAccessRelation() {
   for (int i = Size - 2; i >= 0; --i) {
     isl::space Space;
     isl::map MapOne, MapTwo;
-    isl::pw_aff DimSize = getPwAff(Sizes[i + 1]);
+    isl::pw_aff DimSize = getPwAff(Shape.getSizesOrStrides()[i + 1]);
 
     isl::space SpaceSize = DimSize.get_space();
     isl::id ParamId = SpaceSize.get_dim_id(isl::dim::param, 0);
@@ -1011,13 +1056,11 @@ void MemoryAccess::buildAccessRelation(const ScopArrayInfo *SAI) {
 MemoryAccess::MemoryAccess(ScopStmt *Stmt, Instruction *AccessInst,
                            AccessType AccType, Value *BaseAddress,
                            Type *ElementType, bool Affine,
-                           ArrayRef<const SCEV *> Subscripts,
-                           ArrayRef<const SCEV *> Sizes, Value *AccessValue,
-                           MemoryKind Kind)
+                           ArrayRef<const SCEV *> Subscripts, ShapeInfo Shape,
+                           Value *AccessValue, MemoryKind Kind)
     : Kind(Kind), AccType(AccType), Statement(Stmt), InvalidDomain(nullptr),
-      BaseAddr(BaseAddress), ElementType(ElementType),
-      Sizes(Sizes.begin(), Sizes.end()), AccessInstruction(AccessInst),
-      AccessValue(AccessValue), IsAffine(Affine),
+      BaseAddr(BaseAddress), ElementType(ElementType), Shape(Shape),
+      AccessInstruction(AccessInst), AccessValue(AccessValue), IsAffine(Affine),
       Subscripts(Subscripts.begin(), Subscripts.end()), AccessRelation(nullptr),
       NewAccessRelation(nullptr), FAD(nullptr) {
   static const std::string TypeStrings[] = {"", "_Read", "_Write", "_MayWrite"};
@@ -1029,8 +1072,8 @@ MemoryAccess::MemoryAccess(ScopStmt *Stmt, Instruction *AccessInst,
 
 MemoryAccess::MemoryAccess(ScopStmt *Stmt, AccessType AccType, isl::map AccRel)
     : Kind(MemoryKind::Array), AccType(AccType), Statement(Stmt),
-      InvalidDomain(nullptr), AccessRelation(nullptr),
-      NewAccessRelation(AccRel), FAD(nullptr) {
+      InvalidDomain(nullptr), Shape(ShapeInfo::fromSizes({nullptr})),
+      AccessRelation(nullptr), NewAccessRelation(AccRel), FAD(nullptr) {
   isl::id ArrayInfoId = NewAccessRelation.get_tuple_id(isl::dim::out);
   auto *SAI = ScopArrayInfo::getFromId(ArrayInfoId);
   Sizes.push_back(nullptr);
@@ -1840,10 +1883,12 @@ MemoryAccess *ScopStmt::ensureValueRead(Value *V) {
   if (Access)
     return Access;
 
-  ScopArrayInfo *SAI =
-      Parent.getOrCreateScopArrayInfo(V, V->getType(), {}, MemoryKind::Value);
-  Access = new MemoryAccess(this, nullptr, MemoryAccess::READ, V, V->getType(),
-                            true, {}, {}, V, MemoryKind::Value);
+  // TODO: again, why do we have an _empty_ list here for size?
+  ScopArrayInfo *SAI = Parent.getOrCreateScopArrayInfo(
+      V, V->getType(), ShapeInfo::fromSizes({}), MemoryKind::Value);
+  Access =
+      new MemoryAccess(this, nullptr, MemoryAccess::READ, V, V->getType(), true,
+                       {}, ShapeInfo::fromSizes({}), V, MemoryKind::Value);
   Parent.addAccessFunction(Access);
   Access->buildAccessRelation(SAI);
   addAccess(Access);
@@ -2178,6 +2223,23 @@ void Scop::addParameterBounds() {
   }
 }
 
+// Helper function to getFortranArrayIds() to determine if all the dimensions of
+// an Array are defined as pw_aff's
+static bool hasAllDimensions(polly::ScopArrayInfo *Array,
+                             std::vector<isl::id> &OuterIds) {
+  int NDim = Array->getNumberOfDimensions();
+  for (int i = 0; i < NDim; i++) {
+    isl::pw_aff PwAff = Array->getDimensionSizePw(i);
+    if (!PwAff)
+      return true;
+
+    isl::id Id = PwAff.get_dim_id(isl::dim::param, 0);
+    assert(!Id.is_null() && "Invalid Id for PwAff expression in Fortran array");
+    OuterIds.push_back(Id);
+  }
+  return false;
+}
+
 static std::vector<isl::id> getFortranArrayIds(Scop::array_range Arrays) {
   std::vector<isl::id> OutermostSizeIds;
   for (auto Array : Arrays) {
@@ -2185,16 +2247,10 @@ static std::vector<isl::id> getFortranArrayIds(Scop::array_range Arrays) {
     // for its outermost dimension. Fortran arrays will have this since the
     // outermost dimension size can be picked up from their runtime description.
     // TODO: actually need to check if it has a FAD, but for now this works.
-    if (Array->getNumberOfDimensions() > 0) {
-      isl::pw_aff PwAff = Array->getDimensionSizePw(0);
-      if (!PwAff)
+    int NDim = Array->getNumberOfDimensions();
+    if (NDim > 0)
+      if (hasAllDimensions(Array, OutermostSizeIds))
         continue;
-
-      isl::id Id = PwAff.get_dim_id(isl::dim::param, 0);
-      assert(!Id.is_null() &&
-             "Invalid Id for PwAff expression in Fortran array");
-      OutermostSizeIds.push_back(Id);
-    }
   }
   return OutermostSizeIds;
 }
@@ -3964,27 +4020,93 @@ void Scop::canonicalizeDynamicBasePtrs() {
   }
 }
 
+Value *getPointerFromLoadOrStore(Value *V) {
+  if (LoadInst *LI = dyn_cast<LoadInst>(V))
+    return LI->getPointerOperand();
+
+  if (StoreInst *SI = dyn_cast<StoreInst>(V))
+    return SI->getPointerOperand();
+  return nullptr;
+}
+
 ScopArrayInfo *Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *ElementType,
-                                              ArrayRef<const SCEV *> Sizes,
-                                              MemoryKind Kind,
+                                              ShapeInfo Shape, MemoryKind Kind,
                                               const char *BaseName) {
   assert((BasePtr || BaseName) &&
          "BasePtr and BaseName can not be nullptr at the same time.");
   assert(!(BasePtr && BaseName) && "BaseName is redundant.");
+
+  // We assume that arrays with the strided representation can unify.
+  // Yes this is nuts. Yes I stil want to do this.
+  auto unifyStridedArrayBasePtrs = [&]() -> Value * {
+    if (Shape.hasSizes())
+      return BasePtr;
+
+    const Value *CurBase = getPointerFromLoadOrStore(BasePtr);
+    if (!CurBase)
+      return BasePtr;
+
+    for (ScopArrayInfo *SAI : arrays()) {
+      Value *SAIBase = getPointerFromLoadOrStore(SAI->getBasePtr());
+      if (!SAIBase)
+        continue;
+
+      if (SAIBase == CurBase && SAI->hasStrides())
+        return SAI->getBasePtr();
+    }
+    return BasePtr;
+  };
+
+  BasePtr = unifyStridedArrayBasePtrs();
+
   auto &SAI = BasePtr ? ScopArrayInfoMap[std::make_pair(BasePtr, Kind)]
                       : ScopArrayNameMap[BaseName];
+
+  // errs() << "Creating: " << (int)Kind << "\n";
+  // BasePtr->dump();
+
   if (!SAI) {
     auto &DL = getFunction().getParent()->getDataLayout();
-    SAI.reset(new ScopArrayInfo(BasePtr, ElementType, getIslCtx(), Sizes, Kind,
+    SAI.reset(new ScopArrayInfo(BasePtr, ElementType, getIslCtx(), Shape, Kind,
                                 DL, this, BaseName));
     ScopArrayInfoSet.insert(SAI.get());
   } else {
     SAI->updateElementType(ElementType);
     // In case of mismatching array sizes, we bail out by setting the run-time
     // context to false.
-    if (!SAI->updateSizes(Sizes))
-      invalidate(DELINEARIZATION, DebugLoc());
+    if (SAI->hasStrides() != Shape.hasStrides()) {
+      LLVM_DEBUG(dbgs() << "SAI and new shape do not agree:\n");
+      LLVM_DEBUG(dbgs() << "SAI: "; SAI->print(dbgs(), true); dbgs() << "\n");
+      LLVM_DEBUG(dbgs() << "Shape: " << Shape << "\n");
+
+      if (Shape.hasStrides()) {
+        LLVM_DEBUG(
+            dbgs() << "Shape has strides, SAI had size. Overwriting size "
+                      "with strides");
+        SAI->overwriteSizeWithStrides(Shape.strides(), Shape.offset());
+      } else {
+
+        errs() << __PRETTY_FUNCTION__ << "\n"
+               << "SAI has strides, Shape is size based. This should not "
+                  "happen. Ignoring new data for now.";
+        errs() << " SAI:\n";
+        SAI->print(errs(), false);
+        errs() << "Shape:\n";
+        errs() << Shape << "\n";
+        errs() << "---\n";
+        // report_fatal_error("SAI was given sizes when it had strides");
+        return SAI.get();
+      }
+    }
+
+    if (SAI->hasStrides()) {
+      SAI->updateStrides(Shape.strides(), Shape.offset());
+    } else {
+      if (!SAI->updateSizes(Shape.sizes()))
+        invalidate(DELINEARIZATION, DebugLoc());
+    }
   }
+
   return SAI.get();
 }
 
@@ -4000,7 +4122,8 @@ ScopArrayInfo *Scop::createScopArrayInfo(Type *ElementType,
     else
       SCEVSizes.push_back(nullptr);
 
-  auto *SAI = getOrCreateScopArrayInfo(nullptr, ElementType, SCEVSizes,
+  auto *SAI = getOrCreateScopArrayInfo(nullptr, ElementType,
+                                       ShapeInfo::fromSizes(SCEVSizes),
                                        MemoryKind::Array, BaseName.c_str());
   return SAI;
 }
@@ -4362,7 +4485,7 @@ void Scop::printArrayInfo(raw_ostream &OS) const {
   OS << "Arrays {\n";
 
   for (auto &Array : arrays())
-    Array->print(OS);
+    Array->print(OS, true);
 
   OS.indent(4) << "}\n";
 

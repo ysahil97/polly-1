@@ -1207,6 +1207,42 @@ bool IslNodeBuilder::materializeFortranArrayOutermostDimension() {
   }
   return true;
 }
+void IslNodeBuilder::materializeStridedArraySizes() {
+  for (ScopArrayInfo *Array : S.arrays()) {
+    if (!Array->hasStrides())
+      continue;
+
+    for (unsigned i = 0; i < Array->getNumberOfDimensions(); i++) {
+      isl_pw_aff *ParametricPwAff = Array->getDimensionSizePw(i).release();
+      assert(ParametricPwAff && "parametric pw_aff corresponding "
+                                "to outermost dimension does not "
+                                "exist");
+
+      isl_id *Id = isl_pw_aff_get_dim_id(ParametricPwAff, isl_dim_param, 0);
+      isl_pw_aff_free(ParametricPwAff);
+
+      assert(Id && "pw_aff is not parametric");
+
+      LLVM_DEBUG(dbgs() << "-\n"; dbgs() << "i: " << i << "\n";
+                 dbgs() << "ID: " << Id << "\n";);
+      const SCEV *StrideSCEV = Array->getDimensionStride(i);
+      // dbgs() << "StrideSCEV: " << *StrideSCEV << "\n";
+
+      Value *Stride = generateSCEV(StrideSCEV);
+      assert(Stride);
+
+      // errs() << "StrideVal: " << *Stride << "\n";
+      IDToValue[Id] = Stride;
+      SCEVToValue[Array->getDimensionStride(i)] = Stride;
+      isl_id_free(Id);
+    }
+
+    const SCEV *OffsetSCEV = Array->getStrideOffset();
+    Value *Offset = generateSCEV(OffsetSCEV);
+    assert(Offset);
+    SCEVToValue[OffsetSCEV] = Offset;
+  }
+}
 
 Value *IslNodeBuilder::preloadUnconditionally(isl_set *AccessRange,
                                               isl_ast_build *Build,
@@ -1559,6 +1595,9 @@ void IslNodeBuilder::addParameters(__isl_take isl_set *Context) {
     materializeNonScopLoopInductionVariable(L);
     L = L->getParentLoop();
   }
+
+  // Materialize the stride information for each array
+  materializeStridedArraySizes();
 
   isl_set_free(Context);
 }
