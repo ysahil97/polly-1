@@ -1241,6 +1241,11 @@ void IslNodeBuilder::materializeStridedArraySizes() {
     Value *Offset = generateSCEV(OffsetSCEV);
     assert(Offset);
     SCEVToValue[OffsetSCEV] = Offset;
+
+    const SCEV *BlockOuterDimSCEV = SE.getOne(Offset->getType());
+    Value *BlockOuterDim = generateSCEV(BlockOuterDimSCEV);
+    assert(BlockOuterDim);
+    SCEVToValue[BlockOuterDimSCEV] = BlockOuterDim;
   }
 }
 

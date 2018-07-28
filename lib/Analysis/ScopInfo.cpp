@@ -339,7 +339,7 @@ ScopArrayInfo::ScopArrayInfo(Value *BasePtr, Type *ElementType, isl::ctx Ctx,
   if (Shape.hasSizes())
     updateSizes(Shape.sizes());
   else
-    updateStrides(Shape.strides(), Shape.sizesPerDim(), Shape.offset());
+    updateStrides(Shape.strides(), Shape.offset());
 
   if (!BasePtr || Kind != MemoryKind::Array) {
     BasePtrOriginSAI = nullptr;
@@ -426,32 +426,30 @@ void ScopArrayInfo::applyAndSetFAD(Value *FAD) {
 }
 
 void ScopArrayInfo::overwriteSizeWithStrides(ArrayRef<const SCEV *> Strides,
-                                             ArrayRef<const SCEV *> SizesPerDim,
                                              const SCEV *Offset) {
 
   // HACK: first set our shape to a stride based shape so that we don't
   // assert within updateStrides. Move this into a bool parameter of
   // updateStrides
-  Shape = ShapeInfo::fromStrides(Strides, SizesPerDim, Offset);
-  updateStrides(Strides, SizesPerDim, Offset);
+  Shape = ShapeInfo::fromStrides(Strides, Offset);
+  updateStrides(Strides, Offset);
 }
 bool ScopArrayInfo::updateStrides(ArrayRef<const SCEV *> Strides,
-                                  ArrayRef<const SCEV *> SizesPerDim,
                                   const SCEV *Offset) {
-  Shape.setStrides(Strides, SizesPerDim, Offset);
+  Shape.setStrides(Strides, Offset);
   DimensionSizesPw.clear();
   for (size_t i = 0; i < Shape.getNumberOfDimensions(); i++) {
-    isl::space Space1(S.getIslCtx(), 1, 0);
+    isl::space Space(S.getIslCtx(), 1, 0);
 
-    std::string param_name_1 = getIslCompatibleName(
+    std::string param_name = getIslCompatibleName(
         "stride_" + std::to_string(i) + "__", getName(), "");
-    isl::id IdPwAff1 = isl::id::alloc(S.getIslCtx(), param_name_1, this);
+    isl::id IdPwAff = isl::id::alloc(S.getIslCtx(), param_name, this);
 
-    Space1 = Space1.set_dim_id(isl::dim::param, 0, IdPwAff1);
-    isl::pw_aff PwAff1 =
-        isl::aff::var_on_domain(isl::local_space(Space1), isl::dim::param, 0);
+    Space = Space.set_dim_id(isl::dim::param, 0, IdPwAff);
+    isl::pw_aff PwAff =
+        isl::aff::var_on_domain(isl::local_space(Space), isl::dim::param, 0);
 
-    DimensionSizesPw.push_back(PwAff1);
+    DimensionSizesPw.push_back(PwAff);
   }
   return true;
 }
@@ -4085,8 +4083,7 @@ ScopArrayInfo *Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *ElementType,
         LLVM_DEBUG(
             dbgs() << "Shape has strides, SAI had size. Overwriting size "
                       "with strides");
-        SAI->overwriteSizeWithStrides(Shape.strides(), Shape.sizesPerDim(),
-                                      Shape.offset());
+        SAI->overwriteSizeWithStrides(Shape.strides(), Shape.offset());
       } else {
 
         errs() << __PRETTY_FUNCTION__ << "\n"
@@ -4103,7 +4100,7 @@ ScopArrayInfo *Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *ElementType,
     }
 
     if (SAI->hasStrides()) {
-      SAI->updateStrides(Shape.strides(), Shape.sizesPerDim(), Shape.offset());
+      SAI->updateStrides(Shape.strides(), Shape.offset());
     } else {
       if (!SAI->updateSizes(Shape.sizes()))
         invalidate(DELINEARIZATION, DebugLoc());

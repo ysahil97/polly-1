@@ -32,6 +32,7 @@
 #include "llvm/Analysis/ScalarEvolutionAliasAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
@@ -154,7 +155,7 @@ static Function *createPollyAbstractIndexFunction(Module &M,
     IntegerType *I64Ty = Builder.getInt64Ty();
     std::vector<Type *> ParamTys;
     // offset(1) + stride(numdims) + ix(numdims) =  2 *numdims + 1)
-    for (int i = 1; i <= 1 + 3 * NumDims; i++) {
+    for (int i = 1; i <= 1 + 2 * NumDims; i++) {
       ParamTys.push_back(I64Ty);
     }
     auto FnType = FunctionType::get(I64Ty, ParamTys, /*IsVarArg = */ false);
@@ -171,18 +172,32 @@ static Function *createPollyAbstractIndexFunction(Module &M,
 
   Args[0]->setName("offset");
   // Offset
-  Value *TotalIx = Args[0];
-  for (int i = 0; i < NumDims; i++) {
-    const int SizePerDimIx = NumDims + 1 + i;
+  std::vector<Value *> SizesToBlockValues;
+  Value *TotalIx = Args[0], *OldDimSize = nullptr;
+  Value *BlockOuterDim = ConstantInt::get(TotalIx->getType(), 1);
+  SizesToBlockValues.push_back(BlockOuterDim);
+  for (int i = NumDims - 1; i >= 0; i--) {
     const int StrideIx = 1 + i;
-    const int CurIxIx = (2 * NumDims) + 1 + i;
     Argument *StrideArg = Args[StrideIx];
-    Argument *CurIxArg = Args[CurIxIx];
-    Argument *SizePerDimArg = Args[SizePerDimIx];
-
     StrideArg->setName("stride" + std::to_string(i));
+    if (i) {
+      BlockOuterDim = Builder.CreateMul(
+          StrideArg, BlockOuterDim, "Block_stride_x_ix_" + std::to_string(i));
+      SizesToBlockValues.push_back(BlockOuterDim);
+    }
+  }
+  for (int i = 0; i < NumDims; i++) {
+    // const int SizePerDimIx = NumDims + 1 + i;
+    // const int StrideIx = 1 + i;
+    const int CurIxIx = NumDims + 1 + i;
+    // Argument *StrideArg = Args[StrideIx];
+    Value *StrideArg = SizesToBlockValues[NumDims - i - 1];
+    Argument *CurIxArg = Args[CurIxIx];
+    // Argument *SizePerDimArg = Args[SizePerDimIx];
+
+    // StrideArg->setName("stride" + std::to_string(i));
     CurIxArg->setName("ix" + std::to_string(i));
-    SizePerDimArg->setName("sizePerDim" + std::to_string(i));
+    // SizePerDimArg->setName("sizePerDim" + std::to_string(i));
 
     Value *StrideMulIx = Builder.CreateMul(StrideArg, CurIxArg,
                                            "Stride_x_ix_" + std::to_string(i));

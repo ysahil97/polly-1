@@ -244,7 +244,7 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
   assert(isl_ast_expr_get_op_n_arg(Expr) >= 1 &&
          "We need at least two operands to create a member access.");
 
-  Value *Base, *IndexOp, *Access;
+  Value *Base, *IndexOp1, *IndexOp2, *Access;
   isl_ast_expr *BaseExpr;
   isl_id *BaseId;
 
@@ -289,7 +289,8 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
     return Base;
   }
 
-  IndexOp = nullptr;
+  IndexOp1 = nullptr;
+  IndexOp2 = nullptr;
 
   // TODO: Oh right, I had forgotten about _this_ amazing hack.
   // In a nutshell, when we are generating code on the kernel side, we choose to
@@ -306,24 +307,43 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
   // happening without pen-and-paper. The old code was already not super
   // straightforward, and this just makes it worse.
   if (SAI->hasStrides()) {
+    // Vector of values is used because the Block value computation happens
+    // from outermost dimension to innermost dimension but creation of index
+    // expression happens from innermost to outermost dimension. We need to
+    // store these values temporarily which can be accessed later
+    std::vector<Value *> SizesToBlockValues;
+    // This holds the older size value so that multiplication instruction
+    // gets all its arguments easily
+    Value *OldDimSize = nullptr;
+    // This loop takes care of block value creation
     for (unsigned u = 1, e = isl_ast_expr_get_op_n_arg(Expr); u < e; u++) {
       Value *NextIndex = create(isl_ast_expr_get_op_arg(Expr, u));
       assert(NextIndex->getType()->isIntegerTy() &&
              "Access index should be an integer");
 
       Type *Ty = [&]() {
-        if (IndexOp)
-          return getWidestType(NextIndex->getType(), IndexOp->getType());
+        if (IndexOp1)
+          return getWidestType(NextIndex->getType(), IndexOp1->getType());
         else
           return NextIndex->getType();
       }();
 
       if (Ty != NextIndex->getType())
         NextIndex = Builder.CreateIntCast(NextIndex, Ty, true);
+      // SCEV corresponding to every dimension
+      const SCEV *DimSCEV;
 
-      const SCEV *DimSCEV = SAI->getSizesPerDim(u - 1);
+      // For the index expression, the coefficient of the index associated
+      // with outermost dimension is always 1
+      if (u == 1)
+        DimSCEV = SE.getOne(Ty);
+      // Whereas, for the other dimensions, we cumulatively multiply the
+      // size of the previous outer dimension with its DimSCEV
+      else
+        DimSCEV = SAI->getDimensionStride(e - u);
       assert(DimSCEV);
 
+      // Finding out the Value of DimSCEV
       Value *DimSize = nullptr;
       llvm::ValueToValueMap Map(GlobalMap.begin(), GlobalMap.end());
       // HACK: we do this because we know the kernel name.
@@ -342,7 +362,8 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
         DimSize = expandCodeFor(S, SE, DL, "polly", DimSCEV, DimSCEV->getType(),
                                 &*Builder.GetInsertPoint(), nullptr,
                                 StartBlock->getSinglePredecessor());
-        DimSize = getLatestValue(DimSize);
+        if (u != 1)
+          DimSize = getLatestValue(DimSize);
       }
       assert(DimSize && "dimsize uninitialized");
 
@@ -350,27 +371,55 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
         NextIndex = Builder.CreateSExtOrTrunc(
             NextIndex, Ty,
             "polly.access.idxval." + BaseName + std::to_string(u - 1));
+
       if (Ty != DimSize->getType())
         DimSize = Builder.CreateSExtOrTrunc(DimSize, Ty,
                                             "polly.access.stride." + BaseName +
                                                 std::to_string(u - 1));
+      // We create number of dimensions - 1 instructions which will be used as
+      // coefficients to the thread values(more like indices) which are related
+      // in LIFO order i.e the last value corresponds to the innermost dimension
+      if (u == 1)
+        OldDimSize = DimSize;
+      else {
+        DimSize = createMul(DimSize, OldDimSize,
+                            "polly.access.idxval_x_block_stride." + BaseName +
+                                std::to_string(u - 1));
+        OldDimSize = DimSize;
+      }
+      SizesToBlockValues.push_back(DimSize);
+    }
 
+    // This loop creates the actual index expression for array access
+    for (unsigned u = 1, e = isl_ast_expr_get_op_n_arg(Expr); u < e; u++) {
+      Value *NextIndex = create(isl_ast_expr_get_op_arg(Expr, u));
+      assert(NextIndex->getType()->isIntegerTy() &&
+             "Access index should be an integer");
+
+      Type *Ty = [&]() {
+        if (IndexOp2)
+          return getWidestType(NextIndex->getType(), IndexOp2->getType());
+        else
+          return NextIndex->getType();
+      }();
+
+      Value *DimSize = SizesToBlockValues[e - u - 1];
       NextIndex = createMul(NextIndex, DimSize,
                             "polly.access.idxval_x_stride." + BaseName +
                                 std::to_string(u - 1));
 
       if (PollyDebugPrinting)
         RuntimeDebugBuilder::createCPUPrinter(Builder, "[", NextIndex, "]");
-      if (!IndexOp) {
-        IndexOp = NextIndex;
+      if (!IndexOp2) {
+        IndexOp2 = NextIndex;
       } else {
-        if (Ty != IndexOp->getType())
-          IndexOp = Builder.CreateIntCast(IndexOp, Ty, true);
-        IndexOp =
-            createAdd(IndexOp, NextIndex, "polly.access.idx_accum." + BaseName);
+        if (Ty != IndexOp2->getType())
+          IndexOp2 = Builder.CreateIntCast(IndexOp2, Ty, true);
+        IndexOp2 = createAdd(IndexOp2, NextIndex,
+                             "polly.access.idx_accum." + BaseName);
       } // end else
     }   // end for loop over stride dims
-    assert(IndexOp && "expected correct index op");
+    assert(IndexOp2 && "expected correct index op");
     Value *Offset = nullptr;
     // If we are in the kernel, then the base pointer has already been
     // offset correctly so we need not do anything about it.
@@ -406,8 +455,8 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
       Offset = getLatestValue(Offset);
     }
     assert(Offset && "dimsize uninitialized");
-    Offset = Builder.CreateIntCast(Offset, IndexOp->getType(), true);
-    IndexOp = createAdd(IndexOp, Offset, "polly.access.offseted." + BaseName);
+    Offset = Builder.CreateIntCast(Offset, IndexOp2->getType(), true);
+    IndexOp2 = createAdd(IndexOp2, Offset, "polly.access.offseted." + BaseName);
   } // end hasStride
   else {
     for (unsigned u = 1, e = isl_ast_expr_get_op_n_arg(Expr); u < e; u++) {
@@ -418,17 +467,18 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
       if (PollyDebugPrinting)
         RuntimeDebugBuilder::createCPUPrinter(Builder, "[", NextIndex, "]");
 
-      if (!IndexOp) {
-        IndexOp = NextIndex;
+      if (!IndexOp2) {
+        IndexOp2 = NextIndex;
       } else {
-        Type *Ty = getWidestType(NextIndex->getType(), IndexOp->getType());
+        Type *Ty = getWidestType(NextIndex->getType(), IndexOp2->getType());
 
         if (Ty != NextIndex->getType())
           NextIndex = Builder.CreateIntCast(NextIndex, Ty, true);
-        if (Ty != IndexOp->getType())
-          IndexOp = Builder.CreateIntCast(IndexOp, Ty, true);
+        if (Ty != IndexOp2->getType())
+          IndexOp2 = Builder.CreateIntCast(IndexOp2, Ty, true);
 
-        IndexOp = createAdd(IndexOp, NextIndex, "polly.access.add." + BaseName);
+        IndexOp2 =
+            createAdd(IndexOp2, NextIndex, "polly.access.add." + BaseName);
       }
 
       // For every but the last dimension multiply the size, for the last
@@ -445,19 +495,19 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
                         &*Builder.GetInsertPoint(), nullptr,
                         StartBlock->getSinglePredecessor());
 
-      Type *Ty = getWidestType(DimSize->getType(), IndexOp->getType());
+      Type *Ty = getWidestType(DimSize->getType(), IndexOp2->getType());
 
-      if (Ty != IndexOp->getType())
-        IndexOp = Builder.CreateSExtOrTrunc(IndexOp, Ty,
-                                            "polly.access.sext." + BaseName);
+      if (Ty != IndexOp2->getType())
+        IndexOp2 = Builder.CreateSExtOrTrunc(IndexOp2, Ty,
+                                             "polly.access.sext." + BaseName);
       if (Ty != DimSize->getType())
         DimSize = Builder.CreateSExtOrTrunc(DimSize, Ty,
                                             "polly.access.sext." + BaseName);
-      IndexOp = createMul(IndexOp, DimSize, "polly.access.mul." + BaseName);
+      IndexOp2 = createMul(IndexOp2, DimSize, "polly.access.mul." + BaseName);
     }
   }
 
-  Access = Builder.CreateGEP(Base, IndexOp, "polly.access." + BaseName);
+  Access = Builder.CreateGEP(Base, IndexOp2, "polly.access." + BaseName);
 
   if (PollyDebugPrinting)
     RuntimeDebugBuilder::createCPUPrinter(Builder, "\n");
