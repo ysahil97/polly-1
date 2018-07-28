@@ -120,35 +120,42 @@ private:
 
   llvm::Optional<SmallVector<const SCEV *, 4>> Sizes;
   llvm::Optional<SmallVector<const SCEV *, 4>> Strides;
+  // Introducing SizesPerDim here to store actual dimension sizes
+  llvm::Optional<SmallVector<const SCEV *, 4>> SizesPerDim;
   llvm::Optional<const SCEV *> Offset;
 
   ShapeInfo(Optional<ArrayRef<const SCEV *>> SizesRef,
             Optional<ArrayRef<const SCEV *>> StridesRef,
+            Optional<ArrayRef<const SCEV *>> SizesPerDimRef,
             llvm::Optional<const SCEV *> Offset)
       : Offset(Offset) {
     // Can check for XOR
     assert(bool(SizesRef) || bool(StridesRef));
     assert(!(bool(SizesRef) && bool(StridesRef)));
 
-    if (StridesRef || Offset) {
+    if ((StridesRef || Offset) || SizesPerDimRef) {
       assert(Offset);
       assert(StridesRef);
+      assert(SizesPerDimRef);
     }
 
     if (SizesRef)
       Sizes =
           OptionalSCEVArrayTy(SCEVArrayTy(SizesRef->begin(), SizesRef->end()));
 
-    if (StridesRef)
+    if (StridesRef) {
       Strides = OptionalSCEVArrayTy(
           SCEVArrayTy(StridesRef->begin(), StridesRef->end()));
+      SizesPerDim = OptionalSCEVArrayTy(
+          SCEVArrayTy(SizesPerDimRef->begin(), SizesPerDimRef->end()));
+    }
   }
 
   ShapeInfo(NoneType) : Sizes(None), Strides(None), Offset(None) {}
 
 public:
   static ShapeInfo fromSizes(ArrayRef<const SCEV *> Sizes) {
-    return ShapeInfo(OptionalSCEVArrayRefTy(Sizes), None, None);
+    return ShapeInfo(OptionalSCEVArrayRefTy(Sizes), None, None, None);
   }
 
   // We have this anti-pattern in polly which does this:
@@ -159,20 +166,24 @@ public:
   ShapeInfo(const ShapeInfo &other) {
     Sizes = other.Sizes;
     Strides = other.Strides;
+    SizesPerDim = other.SizesPerDim;
     Offset = other.Offset;
   }
 
   ShapeInfo &operator=(const ShapeInfo &other) {
     Sizes = other.Sizes;
     Strides = other.Strides;
+    SizesPerDim = other.SizesPerDim;
     Offset = other.Offset;
     return *this;
   }
 
   static ShapeInfo fromStrides(ArrayRef<const SCEV *> Strides,
+                               ArrayRef<const SCEV *> SizesPerDim,
                                const SCEV *Offset) {
     assert(Offset && "offset is null");
     return ShapeInfo(None, OptionalSCEVArrayRefTy(Strides),
+                     OptionalSCEVArrayRefTy(SizesPerDim),
                      Optional<const SCEV *>(Offset));
   }
 
@@ -204,18 +215,24 @@ public:
 
   /// Set the strides of the Shape. It checks the invariant
   /// That this shape does not have sizes.
-  void setStrides(ArrayRef<const SCEV *> NewStrides, const SCEV *NewOffset) {
+  void setStrides(ArrayRef<const SCEV *> NewStrides,
+                  ArrayRef<const SCEV *> NewSizesPerDim,
+                  const SCEV *NewOffset) {
     Offset = NewOffset;
     assert(!bool(Sizes));
 
     // Be explicit because GCC(5.3.0) is unable to deduce this.
-    if (!Strides)
+    if (!Strides) {
       Strides = Optional<SmallVector<const SCEV *, 4>>(
           SmallVector<const SCEV *, 4>());
+      SizesPerDim = Optional<SmallVector<const SCEV *, 4>>(
+          SmallVector<const SCEV *, 4>());
+    }
 
     Strides->clear();
     Strides->insert(Strides->begin(), NewStrides.begin(), NewStrides.end());
-
+    SizesPerDim->insert(SizesPerDim->begin(), NewSizesPerDim.begin(),
+                        NewSizesPerDim.end());
     assert(Offset && "offset is null");
   }
 
@@ -236,6 +253,11 @@ public:
   const SmallVector<const SCEV *, 4> &strides() const {
     assert(!bool(Sizes));
     return Strides.getValue();
+  }
+
+  const SmallVector<const SCEV *, 4> &sizesPerDim() const {
+    assert(!bool(Sizes));
+    return SizesPerDim.getValue();
   }
 
   const SmallVector<const SCEV *, 4> &getSizesOrStrides() {
@@ -493,10 +515,12 @@ public:
   ///   would change our view later into the strided version. We should probably
   ///   disallow this for future clients.
   void overwriteSizeWithStrides(ArrayRef<const SCEV *> Strides,
+                                ArrayRef<const SCEV *> SizesPerDim,
                                 const SCEV *Offset);
 
   /// Update the strides of a ScopArrayInfo object.
-  bool updateStrides(ArrayRef<const SCEV *> Strides, const SCEV *Offset);
+  bool updateStrides(ArrayRef<const SCEV *> Strides,
+                     ArrayRef<const SCEV *> SizesPerDim, const SCEV *Offset);
 
   /// Make the ScopArrayInfo model a Fortran array.
   /// It receives the Fortran array descriptor and stores this.
@@ -549,6 +573,11 @@ public:
   const SCEV *getDimensionStride(unsigned Dim) const {
     assert(Dim < getNumberOfDimensions() && "Invalid dimension");
     return Shape.strides()[Dim];
+  }
+
+  const SCEV *getSizesPerDim(unsigned Dim) const {
+    assert(Dim < getNumberOfDimensions() && "Invalid dimension");
+    return Shape.sizesPerDim()[Dim];
   }
 
   const SCEV *getStrideOffset() const { return Shape.offset(); }

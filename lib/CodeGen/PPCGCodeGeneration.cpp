@@ -146,7 +146,7 @@ static Function *createPollyAbstractIndexFunction(Module &M,
   Function *F = [&]() {
     Function *Existing = nullptr;
     if ((Existing = M.getFunction(Name))) {
-      //assert(false);
+      // assert(false);
       return Existing;
     };
 
@@ -154,7 +154,7 @@ static Function *createPollyAbstractIndexFunction(Module &M,
     IntegerType *I64Ty = Builder.getInt64Ty();
     std::vector<Type *> ParamTys;
     // offset(1) + stride(numdims) + ix(numdims) =  2 *numdims + 1)
-    for (int i = 1; i <= 1 + 2 * NumDims; i++) {
+    for (int i = 1; i <= 1 + 3 * NumDims; i++) {
       ParamTys.push_back(I64Ty);
     }
     auto FnType = FunctionType::get(I64Ty, ParamTys, /*IsVarArg = */ false);
@@ -173,13 +173,16 @@ static Function *createPollyAbstractIndexFunction(Module &M,
   // Offset
   Value *TotalIx = Args[0];
   for (int i = 0; i < NumDims; i++) {
+    const int SizePerDimIx = NumDims + 1 + i;
     const int StrideIx = 1 + i;
-    const int CurIxIx = NumDims + 1 + i;
+    const int CurIxIx = (2 * NumDims) + 1 + i;
     Argument *StrideArg = Args[StrideIx];
     Argument *CurIxArg = Args[CurIxIx];
+    Argument *SizePerDimArg = Args[SizePerDimIx];
 
     StrideArg->setName("stride" + std::to_string(i));
     CurIxArg->setName("ix" + std::to_string(i));
+    SizePerDimArg->setName("sizePerDim" + std::to_string(i));
 
     Value *StrideMulIx = Builder.CreateMul(StrideArg, CurIxArg,
                                            "Stride_x_ix_" + std::to_string(i));
@@ -842,6 +845,7 @@ void GPUNodeBuilder::allocateDeviceArrays() {
     DevArrayName.append(Array->name);
 
     Value *ArraySize = getArraySize(Array);
+    // TODO: check if we need this anymore
     Value *Offset = getArrayOffset(Array);
     if (Offset)
       ArraySize = Builder.CreateSub(
@@ -862,6 +866,8 @@ void GPUNodeBuilder::allocateDeviceArrays() {
     }
 
     Value *DevArray = createCallAllocateMemoryForDevice(ArraySize);
+    // Value *DevArray =
+    // createCallAllocateMemoryForDevice(Builder.getInt64(200));
     DevArray->setName(DevArrayName);
     DeviceAllocations[ScopArray] = DevArray;
   }
@@ -1160,6 +1166,7 @@ static bool isPrefix(std::string String, std::string Prefix) {
 Value *GPUNodeBuilder::getArraySize(gpu_array_info *Array) {
   isl::ast_build Build = isl::ast_build::from_context(S.getContext());
   Value *ArraySize = ConstantInt::get(Builder.getInt64Ty(), Array->size);
+  // const auto SAI = (ScopArrayInfo *)(Array->user);
 
   if (!gpu_array_is_scalar(Array)) {
     isl::multi_pw_aff ArrayBound = isl::manage_copy(Array->bound);
@@ -1167,6 +1174,7 @@ Value *GPUNodeBuilder::getArraySize(gpu_array_info *Array) {
     isl::pw_aff OffsetDimZero = ArrayBound.get_pw_aff(0);
     isl::ast_expr Res = Build.expr_from(OffsetDimZero);
 
+    // const unsigned int StartIndex = SAI->hasStrides() ? 0 : 1;
     for (unsigned int i = 1; i < Array->n_index; i++) {
       isl::pw_aff Bound_I = ArrayBound.get_pw_aff(i);
       isl::ast_expr Expr = Build.expr_from(Bound_I);
@@ -1264,8 +1272,10 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
 
   if (Direction == HOST_TO_DEVICE)
     createCallCopyFromHostToDevice(HostPtr, DevPtr, Size);
+  // createCallCopyFromHostToDevice(HostPtr, DevPtr, Builder.getInt64(200));
   else
     createCallCopyFromDeviceToHost(DevPtr, HostPtr, Size);
+  // createCallCopyFromDeviceToHost(DevPtr, HostPtr, Builder.getInt64(200));
 
   isl_id_free(Id);
   isl_ast_expr_free(Arg);
@@ -1856,8 +1866,8 @@ void GPUNodeBuilder::setupKernelSubtreeFunctions(
     Clone->setAttributes(Fn->getAttributes());
 
     assert(Clone && "Expected cloned function to be initialized.");
-    assert(ValueMap.find(Fn) == ValueMap.end() &&
-           "Fn already present in ValueMap");
+    // assert(ValueMap.find(Fn) == ValueMap.end() &&
+    //       "Fn already present in ValueMap");
     ValueMap[Fn] = Clone;
   }
 
@@ -1867,7 +1877,14 @@ void GPUNodeBuilder::setupKernelSubtreeFunctions(
     Function *HostFn = Host->getFunction(BaseName + "_" + std::to_string(i));
     Function *GPUFn = createPollyAbstractIndexFunction(*GPUModule, Builder, i);
     if (HostFn) {
-      assert(ValueMap.find(HostFn) == ValueMap.end());
+      // the chapel compiler actually creates the function definition
+      // and not just stubs the way I used to do (I used to link in the
+      // definitions later on. This invariant needs to be discussed with
+      // the chapel folks, so this is a TODO FIXME
+      // assert(ValueMap.find(HostFn) == ValueMap.end());
+      errs() << "FIXME: discover why we have a duplicate definition of "
+                "polly_abstract_index"
+             << '\n';
       ValueMap[HostFn] = GPUFn;
     }
   }
@@ -3651,7 +3668,8 @@ public:
 
       NodeBuilder.addParameters(S->getContext().release());
       Value *RTC = NodeBuilder.createRTC(Condition);
-      Builder.GetInsertBlock()->getTerminator()->setOperand(0, Builder.getTrue());
+      Builder.GetInsertBlock()->getTerminator()->setOperand(0,
+                                                            Builder.getTrue());
 
       Builder.SetInsertPoint(&*StartBlock->begin());
 

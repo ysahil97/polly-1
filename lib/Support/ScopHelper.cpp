@@ -695,7 +695,7 @@ polly::getAbstractIndexingCall(MemAccInst Inst, ScalarEvolution &SE) {
   //// %3 = getelementptr float, float* %0, i64
   //// %bitcast = bitcast %3 to <otherty>
   //// %2 store float 2.000000e+00, float* %3, align 4 STORE <val> (GEP
-  ///<bitcast>) / (CALL index_2(<strides>, <ixs>)))
+  ///< bitcast>) / (CALL index_2(<strides>, <ixs>)))
 
   //// Case 2. (Total size of array statically known)
   //// %4 = tail call i64 @_gfortran_polly_array_index_2(i64 1, i64 5, i64

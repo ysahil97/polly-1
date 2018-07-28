@@ -683,16 +683,17 @@ bool ScopBuilder::buildAccessPollyAbstractIndex(MemAccInst Inst,
   GEPOperator *GEP;
   std::tie(Call, GEP) = *optionalCallGEP;
 
-  if ((Call->getNumArgOperands()) % 2 != 1) {
+  if ((Call->getNumArgOperands()) % 3 != 1) {
     return false;
   }
 
-  const int NArrayDims = (Call->getNumArgOperands()) / 2;
+  const int NArrayDims = (Call->getNumArgOperands()) / 3;
 
   Value *BasePtr = GEP->getPointerOperand();
 
   std::vector<const SCEV *> Subscripts;
   std::vector<const SCEV *> Strides;
+  std::vector<const SCEV *> SizesPerDim;
   Loop *SurroundingLoop = Stmt->getSurroundingLoop();
 
   InvariantLoadsSetTy AccessILS;
@@ -721,11 +722,13 @@ bool ScopBuilder::buildAccessPollyAbstractIndex(MemAccInst Inst,
     return false;
 
   for (int i = 0; i < NArrayDims; i++) {
-    Value *Ix = Call->getArgOperand(1 + NArrayDims + i);
+    // Handling of Subscripts
+    Value *Ix = Call->getArgOperand(1 + 2 * NArrayDims + i);
     const SCEV *IxSCEV = SE.getSCEV(Ix);
     ensureValueRead(Ix, Stmt);
     Subscripts.push_back(IxSCEV);
 
+    // Handling of Block values (For Chapel Case)
     Value *Stride = Call->getArgOperand(1 + i);
     const SCEV *StrideSCEV = SE.getSCEV(Stride);
 
@@ -739,7 +742,28 @@ bool ScopBuilder::buildAccessPollyAbstractIndex(MemAccInst Inst,
     }
     AccessILS.clear();
 
-    Strides.push_back(StrideSCEV);
+    // I have interchanged Strides and SizesPerDim containers
+    // Because it was the shortest way to avoid changes in
+    // the more common Strides container than the special
+    // SizesPerDim container
+    SizesPerDim.push_back(StrideSCEV);
+
+    // Handling of Dimension Sizes
+    Value *DimSize = Call->getArgOperand(1 + NArrayDims + i);
+    const SCEV *SizePerDimSCEV = SE.getSCEV(DimSize);
+
+    if (!isAffineExpr(&scop->getRegion(), SurroundingLoop, SizePerDimSCEV, SE,
+                      &AccessILS)) {
+      return false;
+    }
+
+    for (LoadInst *L : AccessILS) {
+      scop->addRequiredInvariantLoad(L);
+    }
+    AccessILS.clear();
+
+    // The reasoning for SizesPerDim also applies here
+    Strides.push_back(SizePerDimSCEV);
   }
 
   Value *Val = Inst.getValueOperand();
@@ -755,7 +779,8 @@ bool ScopBuilder::buildAccessPollyAbstractIndex(MemAccInst Inst,
   // NOTE: To be able to change this, we need to teach ScopArrayInfo to recieve
   // a Shape object. So, do that first.
   addArrayAccess(Stmt, Inst, AccType, BasePtr, ElementType, /*IsAffine=*/true,
-                 Subscripts, ShapeInfo::fromStrides(Strides, OffsetSCEV), Val);
+                 Subscripts,
+                 ShapeInfo::fromStrides(Strides, SizesPerDim, OffsetSCEV), Val);
 
   return true;
 }

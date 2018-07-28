@@ -321,7 +321,7 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
       if (Ty != NextIndex->getType())
         NextIndex = Builder.CreateIntCast(NextIndex, Ty, true);
 
-      const SCEV *DimSCEV = SAI->getDimensionStride(u - 1);
+      const SCEV *DimSCEV = SAI->getSizesPerDim(u - 1);
       assert(DimSCEV);
 
       Value *DimSize = nullptr;
