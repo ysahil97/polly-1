@@ -571,9 +571,8 @@ bool isSCEVMultidimArrayAccess(const SCEV *S) {
 bool ScopDetection::isAffine(const SCEV *S, Loop *Scope,
                              DetectionContext &Context) const {
 
-  if (isSCEVMultidimArrayAccess(S)) {
+  if (isSCEVMultidimArrayAccess(S))
     return true;
-  }
 
   InvariantLoadsSetTy AccessILS;
   if (!isAffineExpr(&Context.CurRegion, Scope, S, SE, &AccessILS))

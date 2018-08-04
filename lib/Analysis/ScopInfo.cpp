@@ -4020,7 +4020,7 @@ void Scop::canonicalizeDynamicBasePtrs() {
   }
 }
 
-Value *getPointerFromLoadOrStore(Value *V) {
+static Value *getPointerFromLoadOrStore(Value *V) {
   if (LoadInst *LI = dyn_cast<LoadInst>(V))
     return LI->getPointerOperand();
 
@@ -4061,9 +4061,6 @@ ScopArrayInfo *Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *ElementType,
 
   auto &SAI = BasePtr ? ScopArrayInfoMap[std::make_pair(BasePtr, Kind)]
                       : ScopArrayNameMap[BaseName];
-
-  // errs() << "Creating: " << (int)Kind << "\n";
-  // BasePtr->dump();
 
   if (!SAI) {
     auto &DL = getFunction().getParent()->getDataLayout();

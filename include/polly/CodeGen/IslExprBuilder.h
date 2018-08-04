@@ -277,8 +277,8 @@ private:
   llvm::Value *createMul(llvm::Value *LHS, llvm::Value *RHS,
                          const llvm::Twine &Name = "");
 
-  // Provide a uniform interface to lookup replacements of the old value
-  // in the various maps we provide.
+  /// Provide a uniform interface to lookup replacements of the old value
+  /// in the various maps we provide.
   llvm::Value *getLatestValue(llvm::Value *Old);
 };
 } // namespace polly

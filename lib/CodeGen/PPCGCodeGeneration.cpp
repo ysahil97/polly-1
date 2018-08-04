@@ -884,8 +884,6 @@ void GPUNodeBuilder::allocateDeviceArrays() {
     }
 
     Value *DevArray = createCallAllocateMemoryForDevice(ArraySize);
-    // Value *DevArray =
-    // createCallAllocateMemoryForDevice(Builder.getInt64(200));
     DevArray->setName(DevArrayName);
     DeviceAllocations[ScopArray] = DevArray;
   }
@@ -1184,7 +1182,6 @@ static bool isPrefix(std::string String, std::string Prefix) {
 Value *GPUNodeBuilder::getArraySize(gpu_array_info *Array) {
   isl::ast_build Build = isl::ast_build::from_context(S.getContext());
   Value *ArraySize = ConstantInt::get(Builder.getInt64Ty(), Array->size);
-  // const auto SAI = (ScopArrayInfo *)(Array->user);
 
   if (!gpu_array_is_scalar(Array)) {
     isl::multi_pw_aff ArrayBound = isl::manage_copy(Array->bound);
@@ -1192,7 +1189,6 @@ Value *GPUNodeBuilder::getArraySize(gpu_array_info *Array) {
     isl::pw_aff OffsetDimZero = ArrayBound.get_pw_aff(0);
     isl::ast_expr Res = Build.expr_from(OffsetDimZero);
 
-    // const unsigned int StartIndex = SAI->hasStrides() ? 0 : 1;
     for (unsigned int i = 1; i < Array->n_index; i++) {
       isl::pw_aff Bound_I = ArrayBound.get_pw_aff(i);
       isl::ast_expr Expr = Build.expr_from(Bound_I);
@@ -1290,10 +1286,8 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
 
   if (Direction == HOST_TO_DEVICE)
     createCallCopyFromHostToDevice(HostPtr, DevPtr, Size);
-  // createCallCopyFromHostToDevice(HostPtr, DevPtr, Builder.getInt64(200));
   else
     createCallCopyFromDeviceToHost(DevPtr, HostPtr, Size);
-  // createCallCopyFromDeviceToHost(DevPtr, HostPtr, Builder.getInt64(200));
 
   isl_id_free(Id);
   isl_ast_expr_free(Arg);
@@ -1549,7 +1543,7 @@ getFunctionsFromRawSubtreeValues(SetVector<Value *> RawSubtreeValues,
 }
 
 // return whether `Array` is used in `Kernel` or not.
-bool isArrayUsedInKernel(ScopArrayInfo *Array, ppcg_kernel *Kernel,
+static bool isArrayUsedInKernel(ScopArrayInfo *Array, ppcg_kernel *Kernel,
                          gpu_prog *Prog) {
   for (int i = 0; i < Prog->n_array; i++) {
     isl_id *Id = isl_space_get_tuple_id(Prog->array[i].space, isl_dim_set);

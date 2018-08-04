@@ -669,9 +669,6 @@ private:
   /// True if the newly allocated array is on heap.
   bool IsOnHeap = false;
 
-  /// The sizes of each dimension as SCEV*.
-  // SmallVector<const SCEV *, 4> DimensionSizes;
-
   /// The sizes of each dimension as isl::pw_aff.
   SmallVector<isl::pw_aff, 4> DimensionSizesPw;
 
