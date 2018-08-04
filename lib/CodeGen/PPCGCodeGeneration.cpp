@@ -861,12 +861,15 @@ void GPUNodeBuilder::allocateDeviceArrays() {
 
     Value *ArraySize = getArraySize(Array);
     // TODO: check if we need this anymore
-    Value *Offset = getArrayOffset(Array);
-    if (Offset)
-      ArraySize = Builder.CreateSub(
-          ArraySize,
-          Builder.CreateMul(Offset,
-                            Builder.getInt64(ScopArray->getElemSizeInBytes())));
+    // For Chapel Arrays involving custom arrays, the indices are internally
+    // shifted so that they are proper to access in 0-indexed fashion.
+    // However getArrayOffset() doesn't know this. So we are ignoring it for now
+    //Value *Offset = getArrayOffset(Array);
+    //if (Offset)
+    //  ArraySize = Builder.CreateSub(
+    //      ArraySize,
+    //      Builder.CreateMul(Offset,
+    //                        Builder.getInt64(ScopArray->getElemSizeInBytes())));
     const SCEV *SizeSCEV = SE.getSCEV(ArraySize);
     // It makes no sense to have an array of size 0. The CUDA API will
     // throw an error anyway if we invoke `cuMallocManaged` with size `0`. We
@@ -904,12 +907,12 @@ void GPUNodeBuilder::prepareManagedDeviceArrays() {
       HostPtr = ScopArray->getBasePtr();
     HostPtr = getLatestValue(HostPtr);
 
-    Value *Offset = getArrayOffset(Array);
-    if (Offset) {
-      HostPtr = Builder.CreatePointerCast(
-          HostPtr, ScopArray->getElementType()->getPointerTo());
-      HostPtr = Builder.CreateGEP(HostPtr, Offset);
-    }
+    //Value *Offset = getArrayOffset(Array);
+    //if (Offset) {
+    //  HostPtr = Builder.CreatePointerCast(
+    //      HostPtr, ScopArray->getElementType()->getPointerTo());
+    //  HostPtr = Builder.CreateGEP(HostPtr, Offset);
+    //}
 
     HostPtr = Builder.CreatePointerCast(HostPtr, Builder.getInt8PtrTy());
     DeviceAllocations[ScopArray] = HostPtr;
@@ -1260,7 +1263,7 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
   auto ScopArray = (ScopArrayInfo *)(Array->user);
 
   Value *Size = getArraySize(Array);
-  Value *Offset = getArrayOffset(Array);
+  //Value *Offset = getArrayOffset(Array);
   Value *DevPtr = DeviceAllocations[ScopArray];
 
   Value *HostPtr;
@@ -1271,19 +1274,19 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
     HostPtr = ScopArray->getBasePtr();
   HostPtr = getLatestValue(HostPtr);
 
-  if (Offset) {
-    HostPtr = Builder.CreatePointerCast(
-        HostPtr, ScopArray->getElementType()->getPointerTo());
-    HostPtr = Builder.CreateGEP(HostPtr, Offset);
-  }
+  //if (Offset) {
+  //  HostPtr = Builder.CreatePointerCast(
+  //      HostPtr, ScopArray->getElementType()->getPointerTo());
+  //  HostPtr = Builder.CreateGEP(HostPtr, Offset);
+  //}
 
   HostPtr = Builder.CreatePointerCast(HostPtr, Builder.getInt8PtrTy());
 
-  if (Offset) {
-    Size = Builder.CreateSub(
-        Size, Builder.CreateMul(
-                  Offset, Builder.getInt64(ScopArray->getElemSizeInBytes())));
-  }
+  //if (Offset) {
+  //  Size = Builder.CreateSub(
+  //      Size, Builder.CreateMul(
+  //                Offset, Builder.getInt64(ScopArray->getElemSizeInBytes())));
+  //}
 
   if (Direction == HOST_TO_DEVICE)
     createCallCopyFromHostToDevice(HostPtr, DevPtr, Size);
@@ -1758,14 +1761,14 @@ GPUNodeBuilder::createLaunchParameters(ppcg_kernel *Kernel, Function *F,
     }
     assert(DevArray != nullptr && "Array to be offloaded to device not "
                                   "initialized");
-    Value *Offset = getArrayOffset(&Prog->array[i]);
+    //Value *Offset = getArrayOffset(&Prog->array[i]);
 
-    if (Offset) {
-      DevArray = Builder.CreatePointerCast(
-          DevArray, SAI->getElementType()->getPointerTo());
-      DevArray = Builder.CreateGEP(DevArray, Builder.CreateNeg(Offset));
-      DevArray = Builder.CreatePointerCast(DevArray, Builder.getInt8PtrTy());
-    }
+    //if (Offset) {
+    //  DevArray = Builder.CreatePointerCast(
+    //      DevArray, SAI->getElementType()->getPointerTo());
+    //  DevArray = Builder.CreateGEP(DevArray, Builder.CreateNeg(Offset));
+    //  DevArray = Builder.CreatePointerCast(DevArray, Builder.getInt8PtrTy());
+    //}
     Value *Slot = Builder.CreateGEP(
         Parameters, {Builder.getInt64(0), Builder.getInt64(Index)});
 

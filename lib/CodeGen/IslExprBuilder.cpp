@@ -449,9 +449,10 @@ Value *IslExprBuilder::createAccessAddress(isl_ast_expr *Expr) {
 
       // If we are outside a kernel, then we do need to synthesize an offset.
       OffsetSCEV = SCEVParameterRewriter::rewrite(OffsetSCEV, SE, Map);
+      // The arguments and their mapped values need to be provided here
       Offset = expandCodeFor(S, SE, DL, "polly", OffsetSCEV,
                              OffsetSCEV->getType(), &*Builder.GetInsertPoint(),
-                             nullptr, StartBlock->getSinglePredecessor());
+                             &GlobalMap, StartBlock->getSinglePredecessor());
       Offset = getLatestValue(Offset);
     }
     assert(Offset && "dimsize uninitialized");
