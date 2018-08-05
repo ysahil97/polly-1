@@ -861,15 +861,12 @@ void GPUNodeBuilder::allocateDeviceArrays() {
 
     Value *ArraySize = getArraySize(Array);
     // TODO: check if we need this anymore
-    // For Chapel Arrays involving custom arrays, the indices are internally
-    // shifted so that they are proper to access in 0-indexed fashion.
-    // However getArrayOffset() doesn't know this. So we are ignoring it for now
-    //Value *Offset = getArrayOffset(Array);
-    //if (Offset)
-    //  ArraySize = Builder.CreateSub(
-    //      ArraySize,
-    //      Builder.CreateMul(Offset,
-    //                        Builder.getInt64(ScopArray->getElemSizeInBytes())));
+    Value *Offset = getArrayOffset(Array);
+    if (Offset)
+      ArraySize = Builder.CreateSub(
+          ArraySize,
+          Builder.CreateMul(Offset,
+                            Builder.getInt64(ScopArray->getElemSizeInBytes())));
     const SCEV *SizeSCEV = SE.getSCEV(ArraySize);
     // It makes no sense to have an array of size 0. The CUDA API will
     // throw an error anyway if we invoke `cuMallocManaged` with size `0`. We
@@ -905,12 +902,12 @@ void GPUNodeBuilder::prepareManagedDeviceArrays() {
       HostPtr = ScopArray->getBasePtr();
     HostPtr = getLatestValue(HostPtr);
 
-    //Value *Offset = getArrayOffset(Array);
-    //if (Offset) {
-    //  HostPtr = Builder.CreatePointerCast(
-    //      HostPtr, ScopArray->getElementType()->getPointerTo());
-    //  HostPtr = Builder.CreateGEP(HostPtr, Offset);
-    //}
+    Value *Offset = getArrayOffset(Array);
+    if (Offset) {
+      HostPtr = Builder.CreatePointerCast(
+          HostPtr, ScopArray->getElementType()->getPointerTo());
+      HostPtr = Builder.CreateGEP(HostPtr, Offset);
+    }
 
     HostPtr = Builder.CreatePointerCast(HostPtr, Builder.getInt8PtrTy());
     DeviceAllocations[ScopArray] = HostPtr;
@@ -1259,7 +1256,7 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
   auto ScopArray = (ScopArrayInfo *)(Array->user);
 
   Value *Size = getArraySize(Array);
-  //Value *Offset = getArrayOffset(Array);
+  Value *Offset = getArrayOffset(Array);
   Value *DevPtr = DeviceAllocations[ScopArray];
 
   Value *HostPtr;
@@ -1270,11 +1267,11 @@ void GPUNodeBuilder::createDataTransfer(__isl_take isl_ast_node *TransferStmt,
     HostPtr = ScopArray->getBasePtr();
   HostPtr = getLatestValue(HostPtr);
 
-  //if (Offset) {
-  //  HostPtr = Builder.CreatePointerCast(
-  //      HostPtr, ScopArray->getElementType()->getPointerTo());
-  //  HostPtr = Builder.CreateGEP(HostPtr, Offset);
-  //}
+  if (Offset) {
+    HostPtr = Builder.CreatePointerCast(
+        HostPtr, ScopArray->getElementType()->getPointerTo());
+    HostPtr = Builder.CreateGEP(HostPtr, Offset);
+  }
 
   HostPtr = Builder.CreatePointerCast(HostPtr, Builder.getInt8PtrTy());
 
@@ -1755,14 +1752,14 @@ GPUNodeBuilder::createLaunchParameters(ppcg_kernel *Kernel, Function *F,
     }
     assert(DevArray != nullptr && "Array to be offloaded to device not "
                                   "initialized");
-    //Value *Offset = getArrayOffset(&Prog->array[i]);
+    Value *Offset = getArrayOffset(&Prog->array[i]);
 
-    //if (Offset) {
-    //  DevArray = Builder.CreatePointerCast(
-    //      DevArray, SAI->getElementType()->getPointerTo());
-    //  DevArray = Builder.CreateGEP(DevArray, Builder.CreateNeg(Offset));
-    //  DevArray = Builder.CreatePointerCast(DevArray, Builder.getInt8PtrTy());
-    //}
+    if (Offset) {
+      DevArray = Builder.CreatePointerCast(
+          DevArray, SAI->getElementType()->getPointerTo());
+      DevArray = Builder.CreateGEP(DevArray, Builder.CreateNeg(Offset));
+      DevArray = Builder.CreatePointerCast(DevArray, Builder.getInt8PtrTy());
+    }
     Value *Slot = Builder.CreateGEP(
         Parameters, {Builder.getInt64(0), Builder.getInt64(Index)});
 
@@ -3005,20 +3002,21 @@ public:
 
     isl::local_space LS = isl::local_space(Array->getSpace());
 
-    isl::pw_aff Val = isl::aff::var_on_domain(LS, isl::dim::set, 0);
-    isl::pw_aff OuterMin = AccessSet.dim_min(0);
-    isl::pw_aff OuterMax = AccessSet.dim_max(0);
-    OuterMin = OuterMin.add_dims(isl::dim::in, Val.dim(isl::dim::in));
-    OuterMax = OuterMax.add_dims(isl::dim::in, Val.dim(isl::dim::in));
-    OuterMin = OuterMin.set_tuple_id(isl::dim::in, Array->getBasePtrId());
-    OuterMax = OuterMax.set_tuple_id(isl::dim::in, Array->getBasePtrId());
-
     isl::set Extent = isl::set::universe(Array->getSpace());
+    if (!Array->hasStrides()) {
+      isl::pw_aff Val = isl::aff::var_on_domain(LS, isl::dim::set, 0);
+      isl::pw_aff OuterMin = AccessSet.dim_min(0);
+      isl::pw_aff OuterMax = AccessSet.dim_max(0);
+      OuterMin = OuterMin.add_dims(isl::dim::in, Val.dim(isl::dim::in));
+      OuterMax = OuterMax.add_dims(isl::dim::in, Val.dim(isl::dim::in));
+      OuterMin = OuterMin.set_tuple_id(isl::dim::in, Array->getBasePtrId());
+      OuterMax = OuterMax.set_tuple_id(isl::dim::in, Array->getBasePtrId());
 
-    Extent = Extent.intersect(OuterMin.le_set(Val));
-    Extent = Extent.intersect(OuterMax.ge_set(Val));
-
-    for (unsigned i = 1; i < NumDims; ++i)
+      Extent = Extent.intersect(OuterMin.le_set(Val));
+      Extent = Extent.intersect(OuterMax.ge_set(Val));
+    }
+    const int StartIndex = Array->hasStrides() ? 0 : 1;
+    for (unsigned i = StartIndex; i < NumDims; ++i)
       Extent = Extent.lower_bound_si(isl::dim::set, i, 0);
 
     for (unsigned i = 0; i < NumDims; ++i) {
@@ -3157,6 +3155,7 @@ public:
 
       gpu_array_info &PPCGArray = PPCGProg->array[i];
 
+      PPCGArray.user = Array;
       PPCGArray.space = Array->getSpace().release();
       PPCGArray.type = strdup(TypeName.c_str());
       PPCGArray.size = DL->getTypeAllocSize(Array->getElementType());
@@ -3175,7 +3174,7 @@ public:
       PPCGArray.global = false;
       PPCGArray.linearize = false;
       PPCGArray.dep_order = nullptr;
-      PPCGArray.user = Array;
+      //PPCGArray.user = Array;
 
       PPCGArray.bound = nullptr;
       setArrayBounds(PPCGArray, Array);
